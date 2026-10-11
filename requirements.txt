@@ -1,0 +1,6 @@
+flygym[all]
+opencv-python
+numpy
+matplotlib
+scipy
+imageio-ffmpeg
