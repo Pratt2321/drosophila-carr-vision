@@ -1,5 +1,10 @@
 venv/
 *.mp4
-output/
+output/*.mp4
+output/samples/
+output/test_*.jpg
 __pycache__/
 .DS_Store
+
+# Explicitly keep demo assets and gifs
+!output/carr_escape_jump.gif
