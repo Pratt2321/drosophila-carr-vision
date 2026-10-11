@@ -1,7 +1,7 @@
 # 🪰 Drosophila Embodied 3D Compound-Eye Vision & Looming Escape Simulation
 
 A biologically grounded 3D embodied simulation pipeline that models *Drosophila melanogaster* in FlyGym's MuJoCo physics arena reacting to basketball broadcast footage (Coen Carr fast break highlights).
-
+![Drosophila watching Coen Carr](output/carr_escape_jump.gif)
 ---
 
 ## 🔬 Scientific & Computational Architecture

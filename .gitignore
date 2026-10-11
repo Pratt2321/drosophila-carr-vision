@@ -1,7 +1,7 @@
 venv/
 *.mp4
 output/*.mp4
-output/samples/
+output/samples*/
 output/test_*.jpg
 __pycache__/
 .DS_Store
