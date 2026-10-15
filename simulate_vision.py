@@ -23,20 +23,27 @@ Features:
      - Bottom-Left HUD: Giant Fiber state badge, looming bar, timecode.
   5. H.264 Video Encoding:
      - Web- and VS Code-compatible MP4 (libx264, yuv420p, +faststart).
+  6. Dynamic Video Ingestion:
+     - YouTube URL download/caching via yt-dlp into inputs/.
+     - Local file fallback via --video.
 
 Usage:
     python simulate_vision.py --start-sec 140 --count 600
+    python simulate_vision.py --url "https://youtu.be/<ID>" --start-sec 45 --count 500
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import cv2
 import numpy as np
@@ -63,6 +70,35 @@ except Exception as exc:
 
 
 # ============================================================================
+# Aspect-Ratio Preserving Resize Helper (Letterboxing / Pillarboxing)
+# ============================================================================
+
+def letterbox_resize(
+    img: np.ndarray,
+    target_w: int,
+    target_h: int,
+    interpolation: int = cv2.INTER_AREA,
+) -> np.ndarray:
+    """Resize an image preserving aspect ratio with black letterbox/pillarbox padding."""
+    h, w = img.shape[:2]
+    if h == 0 or w == 0:
+        return np.zeros((target_h, target_w, 3), dtype=np.uint8)
+
+    scale = min(target_w / w, target_h / h)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+
+    interp = interpolation if (new_w <= w and new_h <= h) else cv2.INTER_LINEAR
+    resized = cv2.resize(img, (new_w, new_h), interpolation=interp)
+
+    canvas = np.zeros((target_h, target_w, 3), dtype=img.dtype if img.ndim == 3 else np.uint8)
+    pad_x = (target_w - new_w) // 2
+    pad_y = (target_h - new_h) // 2
+    canvas[pad_y : pad_y + new_h, pad_x : pad_x + new_w] = resized
+    return canvas
+
+
+# ============================================================================
 # Retinal Model
 # ============================================================================
 
@@ -73,6 +109,7 @@ class HexRetina:
 
     def __init__(self) -> None:
         self._flygym_retina = None
+        self.ommatidia_coords: np.ndarray | None = None
 
         if _USE_FLYGYM:
             try:
@@ -80,6 +117,18 @@ class HexRetina:
                 self.num_ommatidia = self._flygym_retina.num_ommatidia_per_eye
                 self._retina_h = self._flygym_retina.nrows
                 self._retina_w = self._flygym_retina.ncols
+
+                # Compute 2D spatial coordinates (mean y, x) for each ommatidium
+                id_map = self._flygym_retina.ommatidia_id_map
+                yy, xx = np.indices(id_map.shape)
+                valid = (id_map >= 0) & (id_map < self.num_ommatidia)
+                ids = id_map[valid]
+                counts = np.bincount(ids, minlength=self.num_ommatidia).astype(float)
+                counts[counts == 0] = 1.0
+                mean_y = np.bincount(ids, weights=yy[valid], minlength=self.num_ommatidia) / counts
+                mean_x = np.bincount(ids, weights=xx[valid], minlength=self.num_ommatidia) / counts
+                self.ommatidia_coords = np.column_stack([mean_y, mean_x])
+
                 print(
                     f"    FlyGym retina active: {self.num_ommatidia} ommatidia, "
                     f"res {self._retina_h}×{self._retina_w}"
@@ -115,6 +164,7 @@ class HexRetina:
                 break
         self._centres = np.array(centres[:n_target])
         self.num_ommatidia = len(self._centres)
+        self.ommatidia_coords = self._centres.copy()
 
         yy, xx = np.mgrid[0:self._retina_h, 0:self._retina_w]
         coords = np.stack([yy, xx], axis=-1).astype(np.float32)
@@ -127,8 +177,8 @@ class HexRetina:
 
     def raw_to_ommatidia(self, frame_bgr: np.ndarray) -> np.ndarray:
         """Map BGR video frame to ommatidia intensities (N, 2)."""
-        small = cv2.resize(
-            frame_bgr, (self._retina_w, self._retina_h), interpolation=cv2.INTER_AREA
+        small = letterbox_resize(
+            frame_bgr, self._retina_w, self._retina_h, interpolation=cv2.INTER_AREA
         )
 
         if self._flygym_retina is not None:
@@ -182,19 +232,45 @@ class LoomingDetector:
         self,
         num_ommatidia: int,
         *,
-        central_fraction: float = 0.35,
-        base_threshold: float = 0.06,
+        ommatidia_coords: np.ndarray | None = None,
+        central_fraction: float = 0.40,
+        base_threshold: float = 0.065,
         adaptation_tau: float = 0.90,
-        cooldown_frames: int = 15,
+        cooldown_frames: int = 18,
     ) -> None:
         self.num_ommatidia = num_ommatidia
-        lo = int(num_ommatidia * (0.5 - central_fraction / 2))
-        hi = int(num_ommatidia * (0.5 + central_fraction / 2))
-        self._central_ids = np.arange(lo, hi)
-
         self.base_threshold = base_threshold
         self.adaptation_tau = adaptation_tau
         self.cooldown_frames = cooldown_frames
+
+        if ommatidia_coords is not None and len(ommatidia_coords) == num_ommatidia:
+            coords = ommatidia_coords
+            cy = (coords[:, 0].min() + coords[:, 0].max()) / 2.0
+            cx = (coords[:, 1].min() + coords[:, 1].max()) / 2.0
+            dy = coords[:, 0] - cy
+            dx = coords[:, 1] - cx
+            radii = np.sqrt(dy**2 + dx**2)
+            max_r = radii.max() if radii.max() > 0 else 1.0
+            r_norm = radii / max_r
+            angles = np.arctan2(dy, dx)
+
+            self._central_mask = r_norm < central_fraction
+            self._peripheral_mask = r_norm > 0.60
+
+            # 8 angular sectors for circular symmetry evaluation
+            self._num_sectors = 8
+            self._sector_masks = []
+            for s in range(self._num_sectors):
+                a0 = -np.pi + s * (2 * np.pi / self._num_sectors)
+                a1 = a0 + (2 * np.pi / self._num_sectors)
+                self._sector_masks.append((angles >= a0) & (angles < a1))
+        else:
+            lo = int(num_ommatidia * (0.5 - central_fraction / 2))
+            hi = int(num_ommatidia * (0.5 + central_fraction / 2))
+            self._central_mask = np.zeros(num_ommatidia, dtype=bool)
+            self._central_mask[lo:hi] = True
+            self._peripheral_mask = ~self._central_mask
+            self._sector_masks = []
 
         self._prev_intensities: np.ndarray | None = None
         self._adapted_threshold = base_threshold
@@ -211,7 +287,7 @@ class LoomingDetector:
         self._prev_intensities = combined.copy()
 
         # ------------------------------------------------------------------
-        # Broadcast Cut Filter (Prevent False Looming Spikes)
+        # 1. Broadcast Cut Filter (Prevent False Looming Spikes)
         # ------------------------------------------------------------------
         # Hard camera angle cuts cause sudden whole-frame jumps across almost
         # all ommatidia simultaneously. Discard from looming accumulator if
@@ -223,7 +299,41 @@ class LoomingDetector:
             # Broadcast cut detected: discard from looming accumulator
             return 0.0, False
 
-        central_delta = delta[self._central_ids]
+        # ------------------------------------------------------------------
+        # 2. Graphic Wipe / Radial Transition Filter
+        # ------------------------------------------------------------------
+        # Suppress Giant Fiber triggers caused by broadcast wipes, metallic
+        # number animations, or radial countdown graphics characterized by:
+        # a) Extreme circular symmetry across all angular sectors
+        # b) High contrast change across peripheral and central rings simultaneously
+        # c) Peripheral expansion dominating central expansion
+        pos_delta = np.clip(delta, 0, None)
+        c_contrast = float(np.mean(global_abs[self._central_mask]))
+        p_contrast = float(np.mean(global_abs[self._peripheral_mask]))
+
+        # Simultaneous high contrast across both central and peripheral rings
+        simultaneous_ring_contrast = (c_contrast > 0.055 and p_contrast > 0.055)
+
+        # Extreme circular symmetry across radial angular sectors
+        circular_symmetry = False
+        if self._sector_masks:
+            sec_vals = [float(np.mean(pos_delta[m])) for m in self._sector_masks]
+            sec_mean = float(np.mean(sec_vals))
+            sec_std = float(np.std(sec_vals))
+            sec_cv = sec_std / (sec_mean + 1e-6)
+            circular_symmetry = (sec_cv < 0.52 and sec_mean > 0.015)
+
+        # Peripheral-dominated expansion (wipes moving across borders)
+        c_exp = float(np.mean(pos_delta[self._central_mask]))
+        p_exp = float(np.mean(pos_delta[self._peripheral_mask]))
+        peripheral_dominated = (p_exp > c_exp and p_contrast > 0.035)
+
+        is_graphic_wipe = simultaneous_ring_contrast or circular_symmetry or peripheral_dominated
+
+        # ------------------------------------------------------------------
+        # 3. Organic Visual Expansion in Central Field
+        # ------------------------------------------------------------------
+        central_delta = delta[self._central_mask]
         expansion = float(np.mean(np.clip(central_delta, 0, None)))
         expansion += 0.5 * float(np.std(central_delta))
 
@@ -239,8 +349,9 @@ class LoomingDetector:
         if self._cooldown_remaining > 0:
             self._cooldown_remaining -= 1
         elif expansion > effective_threshold:
-            triggered = True
-            self._cooldown_remaining = self.cooldown_frames
+            if not is_graphic_wipe:
+                triggered = True
+                self._cooldown_remaining = self.cooldown_frames
 
         return expansion, triggered
 
@@ -570,9 +681,15 @@ class EmbodiedCompositor:
         "RECOVERY": (0, 220, 80),   # green
     }
 
-    def __init__(self, out_h: int = 540, out_w: int = 960) -> None:
+    def __init__(
+        self,
+        out_h: int = 540,
+        out_w: int = 960,
+        screen_title: str = "VIRTUAL SCREEN",
+    ) -> None:
         self.out_h = out_h
         self.out_w = out_w
+        self.screen_title = screen_title
 
         # Inset geometries
         # 1. Top-Right: Virtual Screen (16:9 broadcast inset)
@@ -616,7 +733,7 @@ class EmbodiedCompositor:
         # ------------------------------------------------------------------
         sx, sy = self.screen_x, self.screen_y
         sw, sh = self.screen_w, self.screen_h
-        screen_sub = cv2.resize(raw_video_frame, (sw, sh))
+        screen_sub = letterbox_resize(raw_video_frame, sw, sh)
 
         # Backing bezel & header
         cv2.rectangle(canvas, (sx - 4, sy - 22), (sx + sw + 4, sy + sh + 4), (18, 20, 24), -1)
@@ -625,7 +742,7 @@ class EmbodiedCompositor:
 
         cv2.putText(
             canvas,
-            "VIRTUAL SCREEN // COEN CARR FAST BREAK",
+            self.screen_title,
             (sx + 4, sy - 7),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.40,
@@ -778,6 +895,8 @@ def run_pipeline(
     start_sec: float,
     start_frame_arg: int | None,
     num_frames: int,
+    duration_sec: float | None = None,
+    screen_title: str = "VIRTUAL SCREEN",
 ) -> None:
     """Execute the embodied 3D simulation pipeline."""
 
@@ -793,7 +912,14 @@ def run_pipeline(
         sys.exit(1)
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    raw_fps = cap.get(cv2.CAP_PROP_FPS)
+    if raw_fps is not None and not np.isnan(raw_fps) and raw_fps > 1.0:
+        fps = float(raw_fps)
+    else:
+        fps = 24.0
+
+    if duration_sec is not None:
+        num_frames = int(round(duration_sec * fps))
 
     if start_frame_arg is not None:
         start_frame = start_frame_arg
@@ -821,7 +947,8 @@ def run_pipeline(
     print("[2/4] Initializing looming detector & escape reflex...")
     detector = LoomingDetector(
         retina.num_ommatidia,
-        central_fraction=0.35,
+        ommatidia_coords=retina.ommatidia_coords,
+        central_fraction=0.40,
         base_threshold=0.065,
         adaptation_tau=0.90,
         cooldown_frames=18,
@@ -835,7 +962,7 @@ def run_pipeline(
 
     print("[3/4] Initializing 3D embodied NeuroMechFly simulation...")
     fly_3d = Embodied3DFlySim(render_h=out_h, render_w=out_w)
-    compositor = EmbodiedCompositor(out_h=out_h, out_w=out_w)
+    compositor = EmbodiedCompositor(out_h=out_h, out_w=out_w, screen_title=screen_title)
 
     # 2. Output video writer
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -933,6 +1060,95 @@ def run_pipeline(
 
 
 # ============================================================================
+# YouTube / Local Video Resolver
+# ============================================================================
+
+def extract_youtube_id(url: str) -> str:
+    """Extract YouTube video ID from various URL formats or markdown links."""
+    cleaned = url.strip()
+    if cleaned.startswith("[") and "](" in cleaned and cleaned.endswith(")"):
+        cleaned = cleaned.split("](")[1][:-1].strip()
+    elif cleaned.startswith("<") and cleaned.endswith(">"):
+        cleaned = cleaned[1:-1].strip()
+
+    parsed = urlparse(cleaned)
+    if parsed.hostname in ("youtu.be", "www.youtu.be"):
+        return parsed.path.lstrip("/").split("/")[0].split("?")[0]
+    if parsed.hostname in ("youtube.com", "www.youtube.com", "m.youtube.com"):
+        if parsed.path == "/watch":
+            qs = parse_qs(parsed.query)
+            if "v" in qs:
+                return qs["v"][0]
+        elif parsed.path.startswith(("/embed/", "/v/")):
+            return parsed.path.split("/")[2].split("?")[0]
+    match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11})", cleaned)
+    if match:
+        return match.group(1)
+    return parsed.path.strip("/").split("/")[-1] or "VIDEO"
+
+
+def resolve_video(url: str | None, local_fallback: str) -> str:
+    """Resolve a video source to a local file path.
+
+    If *url* is provided, download (or reuse cached) the YouTube stream
+    into the ``inputs/`` directory.  Otherwise fall back to *local_fallback*.
+    """
+    if not url:
+        return local_fallback
+
+    # Clean markdown link syntax if present
+    cleaned_url = url.strip()
+    if cleaned_url.startswith("[") and "](" in cleaned_url and cleaned_url.endswith(")"):
+        cleaned_url = cleaned_url.split("](")[1][:-1].strip()
+    elif cleaned_url.startswith("<") and cleaned_url.endswith(">"):
+        cleaned_url = cleaned_url[1:-1].strip()
+
+    inputs_dir = Path("inputs")
+    inputs_dir.mkdir(exist_ok=True)
+
+    # Deterministic cache filename based on URL hash
+    url_hash = hashlib.sha256(cleaned_url.encode()).hexdigest()[:12]
+    cached_path = inputs_dir / f"{url_hash}.mp4"
+
+    if cached_path.exists():
+        print(f"[✓] Using cached download: {cached_path}")
+        return str(cached_path)
+
+    try:
+        import yt_dlp  # noqa: F811 — deferred import so yt-dlp is optional
+    except ImportError:
+        print(
+            "[ERROR] yt-dlp is required for --url support.\n"
+            "        Install it with: pip install yt-dlp"
+        )
+        sys.exit(1)
+
+    print(f"[↓] Downloading video from: {cleaned_url}")
+    ydl_opts = {
+        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "outtmpl": str(cached_path),
+        "merge_output_format": "mp4",
+        "quiet": False,
+        "no_warnings": False,
+        "extractor_args": {"youtube": {"player_client": ["default", "web"]}},
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([cleaned_url])
+    except Exception as exc:
+        print(f"[ERROR] Download failed: {exc}")
+        sys.exit(1)
+
+    if not cached_path.exists():
+        print(f"[ERROR] Expected output not found: {cached_path}")
+        sys.exit(1)
+
+    print(f"[✓] Downloaded and cached: {cached_path}")
+    return str(cached_path)
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
@@ -942,12 +1158,16 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--input", "-i", default="coen_carr.mp4",
-        help="Input video path (default: coen_carr.mp4)",
+        "--url", default=None,
+        help="YouTube video URL to download and process",
     )
     parser.add_argument(
-        "--output", "-o", default="output/fly_vs_carr.mp4",
-        help="Output video path (default: output/fly_vs_carr.mp4)",
+        "--video", "-v", default="coen_carr.mp4",
+        help="Local video file path fallback (default: coen_carr.mp4)",
+    )
+    parser.add_argument(
+        "--output", "-o", default="output/fly_reaction.mp4",
+        help="Output video path (default: output/fly_reaction.mp4)",
     )
     parser.add_argument(
         "--start-sec", type=float, default=140.0,
@@ -968,18 +1188,28 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    num_frames = args.count
-    if args.duration_sec is not None:
-        num_frames = int(args.duration_sec * 24.0)
+    # Determine dynamic virtual screen header title
+    if args.url:
+        video_id = extract_youtube_id(args.url)
+        screen_title = f"VIRTUAL SCREEN // YOUTUBE: {video_id}"
+    else:
+        filename = Path(args.video).name
+        screen_title = f"VIRTUAL SCREEN // {filename}"
+
+    # Resolve video source (YouTube download or local file)
+    input_path = resolve_video(args.url, args.video)
 
     run_pipeline(
-        input_path=args.input,
+        input_path=input_path,
         output_path=args.output,
         start_sec=args.start_sec,
         start_frame_arg=args.start,
-        num_frames=num_frames,
+        num_frames=args.count,
+        duration_sec=args.duration_sec,
+        screen_title=screen_title,
     )
 
 
 if __name__ == "__main__":
     main()
+

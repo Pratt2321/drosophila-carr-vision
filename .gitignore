@@ -1,10 +1,20 @@
 venv/
-*.mp4
-output/*.mp4
-output/samples*/
-output/test_*.jpg
+.venv/
 __pycache__/
+*.py[cod]
 .DS_Store
 
-# Explicitly keep demo assets and gifs
+# Ingested and processed videos
+inputs/
+*.mp4
+output/*.mp4
+
+# Test and sample artifacts
+output/samples/
+output/samples*/
+output/test_*
+test_*
+output/blake_*.gif
+
+# Explicitly keep showcase demo assets and gifs
 !output/carr_escape_jump.gif

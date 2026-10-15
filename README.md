@@ -1,18 +1,21 @@
 # 🪰 Drosophila Embodied 3D Compound-Eye Vision & Looming Escape Simulation
 
 A biologically grounded 3D embodied simulation pipeline that models *Drosophila melanogaster* in FlyGym's MuJoCo physics arena reacting to basketball broadcast footage (Coen Carr fast break highlights).
+
 ![Drosophila watching Coen Carr](output/carr_escape_jump.gif)
+
 ---
 
 ## 🔬 Scientific & Computational Architecture
 
 ```
-Broadcast Video (coen_carr.mp4)
+Video Stream (YouTube URL / Local MP4)
        │
        ├──────────────────────────────────────────────┐
        ▼                                              ▼
 ┌──────────────────────────────────────┐  ┌──────────────────────────────────────┐
 │  FlyGym Retina (~721 Ommatidia)      │  │  Virtual Screen Inset (Top-Right)   │
+│  - Letterbox/pillarbox aspect fit    │  │  - Dynamic source header indicator   │
 │  - Pale / Yellow spectral types      │  │  - Broadcast video playback          │
 │  - Green & UV photoreceptor channels │  └──────────────────────────────────────┘
 └──────────────────┬───────────────────┘
@@ -21,6 +24,8 @@ Broadcast Video (coen_carr.mp4)
 ┌──────────────────────────────────────┐
 │  Lobula Plate & Giant Fiber Circuit  │
 │  - Temporal derivative ΔI(t)         │
+│  - Radial angular symmetry filter    │
+│  - Simultaneous ring contrast test   │
 │  - Central field expansion rate      │
 └──────────────────┬───────────────────┘
                    │ Giant Fiber Spike
@@ -48,23 +53,36 @@ Broadcast Video (coen_carr.mp4)
 
 ---
 
-## 🚀 Quickstart
+## 🏆 Tested Showcase Highlights
 
-### Prerequisites
-- Python 3.12+ (or 3.11+)
-- Virtual environment support
+While **Coen Carr's explosive fast breaks** serve as the primary showcase, the pipeline has also been benchmarked and verified across classic NBA transition sequences:
 
-### One-Command Runner
-Execute the automated bash runner script:
+- **Blake Griffin vs. Kendrick Perkins (2012 Poster Dunk):**
+  - **Source:** YouTube (`OZ9o7owSUcQ` at 02:08)
+  - **Benchmark Result:** The automated transition filter successfully detects and suppresses the metallic circular broadcast countdown wipe ("#3") at 00:03. The Giant Fiber escape reflex triggers with high biological fidelity only when Griffin elevates directly toward the camera to finish the dunk at 00:10.
+
+---
+
+## 🚀 Quickstart: Test Any Video
+
+### 1. Environment Setup
+```bash
+python3.11 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
+```
+
+### 2. Run the Default Coen Carr Showcase
 ```bash
 ./run.sh
 ```
 
-### Manual Execution
-
+### 3. Run Custom Videos (YouTube or Local File)
+Run directly from an arbitrary YouTube video (automatically downloaded and cached in `inputs/`):
 ```bash
-source venv/bin/activate
-python simulate_vision.py --start-sec 140 --count 600
+# Run directly from a YouTube link
+./run.sh --url "https://youtu.be/<ID>" --start-sec 45 --count 500
+
+# Or run a local file
+./run.sh --video "path/to/video.mp4" --start-sec 10 --count 400
 ```
 
 ---
@@ -73,50 +91,58 @@ python simulate_vision.py --start-sec 140 --count 600
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--input` | `-i` | `coen_carr.mp4` | Path to source broadcast video |
-| `--output` | `-o` | `output/fly_vs_carr.mp4` | Path for generated MP4 video |
-| `--start-sec` | | `140.0` | Start timestamp in seconds (02:20 = Carr on the fast break) |
+| `--url` | | `None` | YouTube video URL to download and process |
+| `--video` | `-v` | `coen_carr.mp4` | Local video file path fallback (used when `--url` is not set) |
+| `--output` | `-o` | `output/fly_reaction.mp4` | Destination MP4 output path |
+| `--start-sec` | | `140.0` | Start timestamp in seconds (default: 02:20 = Carr fast break) |
 | `--start` | `-s` | `None` | Start frame index (overrides `--start-sec` if provided) |
 | `--count` | `-n` | `600` | Number of sequential frames to process |
-| `--duration-sec` | | `None` | Duration in seconds (overrides `--count` if provided) |
-
-Examples:
-```bash
-# Run full 600 frames from 02:20
-./run.sh --start-sec 140 --count 600
-
-# Run 30 seconds starting at 02:20
-./run.sh --start-sec 140 --duration-sec 30
-```
+| `--duration-sec` | | `None` | Duration in seconds (overrides `--count`, using stream FPS) |
 
 ---
 
-## 📊 Pipeline Components
+## 📊 Pipeline Components & Features
 
-### 1. Embodied NeuroMechFly 3D Physics (`Embodied3DFlySim`)
-- Instantiates FlyGym's `NeuroMechFly` model in `FlatGroundWorld` with active leg joints (`JointPreset.LEGS_ACTIVE_ONLY`) and articulated wing hinge joints (`l_wing_yaw`, `l_wing_pitch`, `r_wing_yaw`, `r_wing_pitch`).
-- A third-person over-the-shoulder camera tracks the fly from behind-left, overlooking the arena with full clearance for ballistic escape jumps.
-- When the Giant Fiber fires, active kinematic and joint angle transitions govern the embodied jump mechanics:
-  - **FREEZE**: Lowers center of mass (COM) / root Z elevation, crouching and slightly tucking legs.
-  - **JUMP**: Explosive ballistic extension impulse driving the mesothoracic and metathoracic legs (`trochanterfemur` and `tibia` joints) backwards and thrusting the fly root Z-position off the arena floor.
-  - **FLIGHT**: Wings spread outward and upward with high-frequency flutter oscillation (`wing_pitch` / `wing_yaw`), airborne root elevation, and aerodynamic leg flexion.
-  - **RECOVERY**: Smooth cosine-interpolated joint and COM reset back to neutral stance over 12 frames.
+### 1. Dynamic Video Ingestion & Caching (`resolve_video`)
+- **`--url`**: Downloads the optimal MP4+M4A stream via `yt-dlp` into `inputs/`, indexed by a deterministic SHA-256 hash. Cached streams are reused automatically on subsequent runs.
+- **`--video`**: Seamlessly falls back to local media files.
+- **Dynamic Header**: Insets display `VIRTUAL SCREEN // YOUTUBE: <VIDEO_ID>` for streams or `VIRTUAL SCREEN // <FILENAME>` for local clips.
 
-### 2. Biological Retinal Mapping (`HexRetina`)
-- Maps frames to the **721 ommatidia** per eye using FlyGym's `Retina`.
-- Reconstructs biological hexagonal mosaic using JIT `hex_pxls_to_human_readable` with green (pale) and UV/violet (yellow) photoreceptors.
+### 2. Aspect-Ratio Preserving Letterboxing (`letterbox_resize`)
+- Any incoming video aspect ratio (16:9, 4:3, square 1:1, or 9:16 vertical mobile) is safely letterboxed/pillarboxed with black padding before projecting onto the compound-eye retina or HUD display, preventing artificial optical stretching.
 
-### 3. Lobula Plate & Giant Fiber Circuit (`LoomingDetector`)
-- Calculates the temporal derivative $\Delta I(t) = I(t) - I(t - \Delta t)$.
-- **Broadcast Cut Filter**: Filters out hard broadcast camera switches by measuring whole-frame absolute deltas. If a large global fraction (>50%) of ommatidia jump simultaneously or mean global delta exceeds threshold, it is classified as a broadcast cut and discarded from the looming accumulator, preventing false escape triggers.
-- Monitors expansion $\frac{d\theta}{dt}$ in the central visual field ($35\%$ central ommatidia) with adaptive thresholding and refractory cooldown to trigger primarily when Coen Carr accelerates toward the camera or elevates toward the rim on the fast break.
+### 3. Stream FPS Adaptation
+- Queries stream metadata via `cv2.CAP_PROP_FPS` to drive simulation timing, timecode badges, and frame rate encoding (falling back to standard 24 fps if unspecified).
 
-### 4. High-Tech Inset Compositor (`EmbodiedCompositor`)
-- **Main Stage**: The 3D fly body reacting in the MuJoCo arena.
-- **Top-Right Inset**: Virtual Screen playing the Coen Carr broadcast footage with a cyan tech bezel.
-- **Bottom-Right Inset**: Hexagonal ommatidia readout showing the fly's compound-eye perception.
-- **Bottom-Left HUD**: Giant Fiber State Indicator Badge, real-time Looming Expansion meter, broadcast timecode, and escape counter.
+### 4. Graphic Wipe & Radial Transition Filter (`LoomingDetector`)
+- Television broadcasts often feature synthetic wipes, spinning logos, or metallic countdown graphics that cause whole-screen brightness shifts. The detector filters out non-biological transitions via:
+  - **Simultaneous Ring Contrast:** Detects uniform contrast surges across both peripheral ($r > 0.60$) and central ($r < 0.40$) rings.
+  - **Circular Symmetry:** Evaluates coefficient of variation across 8 radial angular sectors ($CV_\theta < 0.52$).
+  - **Peripheral Dominance:** Identifies outward edge-sweeps where peripheral expansion outpaces central expansion.
 
-### 5. Web & VS Code H.264 Transcoding (`transcode_to_h264`)
-- Encodes output directly to standard **H.264** (`libx264` / `avc1`) with **YUV420p** pixel formatting and `+faststart` metadata headers.
-- Plays natively inside VS Code's built-in media viewer, web browsers, and QuickTime.
+### 5. Biological Retinal Mapping (`HexRetina`)
+- Maps video frames to 721 ommatidia per eye using FlyGym's hexagonal photoreceptor model, simulating green (pale) and UV/violet (yellow) spectral sensitivity.
+
+### 6. Embodied NeuroMechFly 3D Physics (`Embodied3DFlySim`)
+- FlyGym's `NeuroMechFly` model in `FlatGroundWorld` with active leg joints and articulated wing hinges (`l_wing_yaw`, `l_wing_pitch`, `r_wing_yaw`, `r_wing_pitch`).
+- Giant Fiber activation initiates a stereotyped kinematic reflex:
+  - **FREEZE:** Crouch lowering center of mass.
+  - **JUMP:** Ballistic leg extension impulse launching into positive vertical clearance.
+  - **FLIGHT:** High-frequency wing flutter and leg retraction.
+  - **RECOVERY:** Smooth cosine-interpolated return to neutral standing posture.
+
+### 7. Web & VS Code H.264 Transcoding (`transcode_to_h264`)
+- Automatically encodes outputs using `libx264` (YUV420p) with `+faststart` metadata for instant streaming in VS Code, QuickTime, and modern web browsers.
+
+---
+
+## 🔬 Known Biological & Computational Limitations
+
+When running arbitrary videos through the pipeline, visual responses reflect the specific neuroethology of fly looming detection:
+
+1. **Looming Velocity & Scale ($\frac{d\theta}{dt}$):**
+   - The Giant Fiber escape circuit specifically responds to accelerating radial optical expansion. Objects filmed from a distance, moving tangentially across the visual field (lateral motion), or shown in slow motion do not produce sufficient central angular velocity to trip the reflex.
+2. **Framing & Central Receptive Field:**
+   - In nature, impending predatory threats (e.g. birds, swatters) loom directly toward the head. In videos, the approaching subject must be reasonably centered and occupy a significant fraction of the field of view. Far-away subjects will not trip the threshold unless zoomed or cropped.
+3. **Broadcast & Compression Artifacts:**
+   - Sudden camera cuts, flash photography, strobe lighting, and rapid digital transitions can occasionally trigger brief transient spikes. While the global shift filter and radial circular symmetry filter suppress most television wipes, extreme full-screen strobe sequences can occasionally challenge threshold adaptation.

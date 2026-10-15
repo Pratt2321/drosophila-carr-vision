@@ -3,12 +3,14 @@
 #  Drosophila Compound-Eye Vision Pipeline — Runner
 # ============================================================
 #  Installs dependencies into a local venv and runs the
-#  simulation pipeline with sensible defaults.
+#  simulation pipeline.  All CLI arguments are forwarded
+#  directly to simulate_vision.py.
 #
 #  Usage:
-#    ./run.sh                              # defaults
-#    ./run.sh --start 400 --count 500      # custom window
-#    ./run.sh -i other_video.mp4           # different input
+#    ./run.sh                                          # defaults
+#    ./run.sh --start-sec 140 --count 500              # custom window
+#    ./run.sh --url "https://youtu.be/<ID>"            # YouTube video
+#    ./run.sh --video other_video.mp4                  # local file
 # ============================================================
 
 set -euo pipefail
@@ -26,7 +28,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "  🪰  Drosophila Compound-Eye Pipeline"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-for candidate in python3.14 python3.13 python3.12 python3; do
+for candidate in python3.14 python3.13 python3.12 python3.11 python3; do
     if command -v "$candidate" &>/dev/null; then
         PYTHON="$candidate"
         break
@@ -63,21 +65,14 @@ pip install -r requirements.txt --quiet 2>&1 | tail -5
 echo "      ✓ Dependencies installed."
 
 # ------------------------------------------------------------------
-# 4. Run the pipeline
+# 4. Run the pipeline — forward all CLI args
 # ------------------------------------------------------------------
 echo "[4/4] Running simulation pipeline..."
 echo ""
 
-python simulate_vision.py \
-    --input     "coen_carr.mp4" \
-    --output    "output/fly_vs_carr.mp4" \
-    --start-sec 140 \
-    --count     600 \
-    "$@"
+python simulate_vision.py "$@"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  ✓ Pipeline complete!"
-echo "  📹 Output: output/fly_vs_carr.mp4 (H.264 / yuv420p)"
-echo "  ▶ Ready for playback directly in VS Code!"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
